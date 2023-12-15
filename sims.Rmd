@@ -1,0 +1,273 @@
+---
+title: "Code for 2023 MIT 15.838 DAOE Term Paper"
+output: html_notebook
+---
+
+## Load packages. 
+
+```{r}
+library(tidyverse)
+library(car) 
+library(broom.mixed)
+library(ggsci)
+library(foreach)
+```
+
+## Import and clean data from Experiment 1 from White and Perfors (2023)
+
+```{r import-data, warning = FALSE}
+d <- read_csv(
+  "https://raw.githubusercontent.com/WhiteJP/AmbiguityAversionProject/master/experiment/data/exp1data.csv",
+  col_types = "ffffffnnfnfc"
+)
+
+d$vignetteAnswer[d$answerOrder == "A"] <- recode(
+  d$vignetteAnswer[d$answerOrder == "A"], 
+  "1 = 3; 2 = 2; 3 = 1;4 = 0; 5 = -1; 6 = -2; 7 = -3"
+)
+
+d$vignetteAnswer[d$answerOrder == "B"] <- recode(
+  d$vignetteAnswer[d$answerOrder == "B"],
+  "1 = -3; 2 = -2; 3 = -1; 4 = 0; 5 = 1; 6 = 2; 7 = 3"
+)
+
+# Remove testing and instruction check fails
+andy.testing <- grep("amy", d$postQuestion2)
+d_andyremoved <- d[-andy.testing,]
+instr_fail <- d_andyremoved$postQuestion1 == "incorrect" | d_andyremoved$dummyVignetteAnswer <= 4
+d_pass <- d_andyremoved[!instr_fail,]
+```
+
+## Simulations
+
+### To evaluate testing procedure in White and Perfors (2023)
+
+Not ultimately included in term paper. Analysis properties of test used in paper 
+to determiner there was significant mean AA variation between vignettes. 
+
+```{r graph}
+d <- d_pass %>% 
+  mutate(
+    y = ordered(vignetteAnswer)
+  )
+
+null_sim <- function(N) {
+  AIC_a <- AIC_b <- var_b <- sig <- jpw::zeros(N)
+  out <- data.frame(AIC_a, AIC_b, var_b, sig)
+  n <- nrow(d)
+  v <- d$vignette %>% unique()
+
+  for (i in seq_len(N)){
+    d$z <- sample(v, n, replace = TRUE)  #new treatment vector for vignettes
+    a <- ordinal::clm(y ~ 1, data = d, link = "logit") 
+    b <- ordinal::clmm(y ~ 1 + (1|z), data = d, link = "logit", nAGQ = 5)
+    out$AIC_a[i] <- AIC(a) 
+    out$AIC_b[i] <- AIC(b)
+    out$var_b[i] <- summary(b)$ST[[1]]
+    out$sig[i] <- AIC(b) < AIC(a)
+  }
+  out
+}
+
+eff_sim <- function(N, eff) {
+  AIC_a <- AIC_b <- sd_a <- sd_b <- z_sd_b <- AIC_diff <- sig <- jpw::zeros(N)
+  out <- data.frame(AIC_a, AIC_b, sd_a, sig)
+  n <- nrow(d)
+  v <- d$vignette %>% unique()
+
+  for (i in seq_len(N)){
+    d$z <- sample(v, n, replace = TRUE)  #new treatment vector
+    z_sd <- set_names(rnorm(length(v), sd = eff), v)
+    d$y <- d$vignetteAnswer + z_sd[d$z]
+    a <- lm(y ~ 1, data = d) 
+    b <- lme4::lmer(y ~ 1 + (1|z), data = d)
+    tidy_b <- broom.mixed::tidy(b) # probably should do whole thing like this. 
+    out$AIC_a[i] <- AIC(a) 
+    out$AIC_b[i] <- AIC(b)
+    AIC_diff[i] <- AIC(a) - AIC(b)
+    out$sd_a[i] <- sigma(a)
+    out$sd_b[i] <- sigma(b)
+    out$z_sd_b[i] <- tidy_b$estimate[2]
+    out$sig[i] <- AIC(b) < AIC(a)
+  }
+  out
+}
+
+##run sims
+effs <- c(0.1, 0.3, 0.5, 1)
+nsims <- 100
+res <- list()
+for(i in seq_along(effs)){
+  res[[i]] <- eff_sim(nsims, effs[i])
+}
+
+#see results
+data_frame(
+  effs = effs,
+  sim = res,
+  AICs_a = map(sim, "AIC_a"),
+  AICs_b = map(sim, "AIC_b"),
+  power = map_dbl(sim, ~ mean(.x$sig)),
+  meanAIC_a = map_dbl(AICs_a, mean),
+  meanAIC_b = map_dbl(AICs_b, mean),
+)
+
+```
+
+### Simulations to evaluate optimum number of vignettes in experimental design. 
+
+Assume sample size of 1200 (similar to paper). First get approximations for the  underlying parameters from our data. (i.e., mean ambiguity aversion, overall variation, variation in mean AA between vignettes).
+
+```{r}
+mean(d$vignetteAnswer)
+sd(d$vignetteAnswer)
+
+d %>% group_by(vignetteType) %>%
+  summarise(across(vignetteAnswer, list(mean = mean, sd = sd)))
+
+d %>% group_by(vignette) %>%
+  summarise(across(vignetteAnswer, list(mean = mean, sd = sd))) %>% 
+  summarise(sd = sd(vignetteAnswer_mean))
+
+```
+
+## Run Simulations 
+
+```{r}
+# sim function
+do_sim = function(N, V, mean_eff, sd_eff) {
+  variants = rnorm(V, sd = sd_eff)
+  d = data.frame(
+    u = rnorm(N),
+    v = sample(rep(variants, ceiling(N / V)), N)
+  ) 
+  d$y <- mean_eff + d$u + d$v
+  fit = lme4::lmer(y ~ (1 | v), data = d)
+  broom.mixed::tidy(fit, conf.int = TRUE)
+}
+
+#set params
+Nsim <- 1000
+params <- expand.grid(
+  N = 1200, # approx same sample size as original study
+  V = c(25, 50, 100, 300, 600, 900, 1100, 1150, 1175),
+  m = c(.1, .25, .5),
+  s = c(.1, .25, .5, 1),
+  r = 1:Nsim
+) 
+
+#run sims in parallel - on windows, uses snow
+library(doParallel)
+cl <- makeCluster(12)
+registerDoParallel(cl)
+
+results <- foreach(
+  i = 1:nrow(params),
+  .combine = bind_rows
+) %dopar% {
+  tmp <- do_sim(params$N[i], params$V[i], params$m[i], params$s[i])
+  tmp$V <- params$V[i]
+  tmp$m <- params$m[i]
+  tmp$s <- params$s[i]
+  tmp
+}
+
+# parse results 
+rs <- results %>%
+  mutate(
+  estimand = case_when(
+    term == "(Intercept)" ~ m,
+    term == "sd__(Intercept)" ~ s,
+    TRUE ~ 1
+  )) %>% 
+  group_by(V, m, s, effect, term) %>%
+  summarize(
+    sd = sd(estimate),
+    rmse_sd = sqrt(mean((estimate - estimand)^2)), 
+    bias = mean(estimate - estimand),
+    mean_ci_width = mean(conf.high - conf.low),
+    coverage = mean(estimand <= conf.high & estimand >= conf.low),
+    power = mean(conf.low > 0 | conf.high < 0)
+  ) %>% 
+  ungroup()
+
+```
+
+### Plot Random intercept Standard Deviation
+
+```{r, plot-SD}
+rs %>% 
+  filter(term == "sd__(Intercept)") %>%   
+  pivot_longer(c(sd, bias), names_to = "Diagnosand") %>% 
+  ggplot(aes(x = V, y = value, group = Diagnosand, col = Diagnosand)) +
+  geom_line() +
+  facet_grid(
+    m~s, 
+    labeller = labeller(
+      m =  \(x) paste0("Mean = ", x), 
+      s =  \(x) paste0("SD = ", x)
+    )
+  ) +
+  theme_bw() +
+  labs(
+    x = "Number of Vignettes",
+    y = " "
+  ) +
+  ggsci::scale_color_d3() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 7)
+    )
+
+ggsave("SDsimresults.png", width = 7, height = 5, units = "in", dpi = 600)
+```
+
+### Plot Fixed Intercept
+
+```{r plot-mean}
+rs %>% 
+  filter(term == "(Intercept)") %>% 
+  dplyr::select(-rmse_sd) %>% 
+  pivot_longer(sd:power) %>% 
+  ggplot(
+    aes(x = V, y = value, group = name, col = name)
+  ) +
+  geom_line() +
+  theme_bw()  +
+  facet_grid(
+    m~s, 
+    labeller = labeller(
+      m =  \(x) paste0("Mean = ", x), 
+      s =  \(x) paste0("SD = ", x)
+    )
+  ) +
+  theme_bw() +
+  labs(
+    x = "Number of Vignettes",
+    y = " "
+  ) +
+  ggsci::scale_color_d3() +
+  theme(
+    legend.position = "bottom",
+    axis.text.x = element_text(size = 7)
+    )
+
+ggsave("Meansimresults.png", width = 7, height = 5, units = "in", dpi = 600)
+```
+
+```{r extras, eval=FALSE}
+# some extra code when I was considering looking at 
+
+#library(ExtDist)
+#
+#t_sd <- function(df) {
+#  sqrt(df/(df-2))
+#}
+#laplace_sd <- function(b) {
+#  sqrt(2)*b
+#}
+## try it with normal distribution and then maybe with a t-distribution. 
+#variants = rt(V, 20) #t
+  #variants = ExtDist::rLaplace(V, b = 0.35)
+
+```
